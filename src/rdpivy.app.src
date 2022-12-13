@@ -1,0 +1,22 @@
+{application, rdpivy,
+ [{description, "An OTP application"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {mod, {rdpivy_app, []}},
+  {applications,
+   [kernel,
+    stdlib,
+    lager,
+    inets,
+    ssl,
+    rdp_lvgl,
+    rdp_proto,
+    ebox,
+    apdu
+   ]},
+  {env,[]},
+  {modules, []},
+
+  {licenses, ["BSD-2-Clause"]},
+  {links, []}
+ ]}.
