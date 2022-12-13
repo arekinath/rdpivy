@@ -157,7 +157,12 @@ make_group(TopLevel, Symbol, #?MODULE{inst = Inst, sty = Sty}) ->
 make_err_lbl(Parent, Fmt, Args) ->
     {ok, Lbl} = lv_label:create(Parent),
     Msg = io_lib:format(Fmt, Args),
-    ok = lv_label:set_text(Lbl, Msg),
+    MsgLen = iolist_size(Msg),
+    MsgTrunc = if MsgLen > 512 ->
+        binary:part(iolist_to_binary(Msg), {0, 512});
+        true -> Msg
+    end,
+    ok = lv_label:set_text(Lbl, MsgTrunc),
     ok = lv_obj:set_style_text_color(Lbl, lv_color:make(16#FF6060)),
     ok = lv_obj:center(Lbl).
 make_err_lbl(Parent, Fmt) ->
@@ -340,11 +345,12 @@ get_chal(enter, _PrevState, S0 = #?MODULE{inst = Inst, sty = Sty}) ->
 
     ok = lv_scr:load_anim(Inst, Screen, fade_in, 500, 0, true),
     ok = lv_indev:set_group(Inst, keyboard, InpGroup),
-    {keep_state, S0#?MODULE{screen = Flex}};
+    {keep_state, S0#?MODULE{screen = Flex, events = [BtnEvent, AcEvent]}};
 
 get_chal(info, {_, {submit, ChalInp}}, S0 = #?MODULE{inst = Inst, screen = Scr}) ->
     {ok, Data} = lv_textarea:get_text(ChalInp),
-    Lines0 = binary:split(Data, [<<"\n">>]),
+    Lines0 = binary:split(Data, [<<"\r\n">>, <<"\n">>], [global]),
+    lager:debug("lines = ~p", [Lines0]),
     Lines1 = lists:filter(fun
         (<<"--", _/binary>>) -> false;
         (_) -> true
@@ -352,7 +358,9 @@ get_chal(info, {_, {submit, ChalInp}}, S0 = #?MODULE{inst = Inst, screen = Scr})
     Lines2 = lists:map(fun (Line) ->
         re:replace(Line, "[^-A-Za-z0-9+/=]", "", [global])
     end, Lines1),
-    case (catch base64:decode(iolist_to_binary(Lines2))) of
+    Base64 = iolist_to_binary(Lines2),
+    lager:debug("base64 = ~s", [Base64]),
+    case (catch base64:decode(Base64)) of
         {'EXIT', Why} ->
             make_err_lbl(Scr, "Base64 error: ~p", [Why]),
             keep_state_and_data;
@@ -362,6 +370,7 @@ get_chal(info, {_, {submit, ChalInp}}, S0 = #?MODULE{inst = Inst, screen = Scr})
                     make_err_lbl(Scr, "Ebox decode error: ~p", [Why]),
                     keep_state_and_data;
                 B0 = #ebox_box{unlock_key = {Point, Curve}} ->
+                    make_err_lbl(Scr, "decode ok"),
                     keep_state_and_data
             end
     end.
