@@ -46,7 +46,11 @@
     loading/3,
     login/3,
     check_pin/3,
-    get_chal/3
+    get_chal/3,
+    decrypt/3,
+    confirm/3,
+    decrypt_key/3,
+    response/3
     ]).
 
 -spec start_link(rdp_server:server(), lv:instance(), lv:point()) ->
@@ -66,7 +70,11 @@ start_link(Srv, Inst, Res) ->
     pin :: undefined | binary(),
     piv :: undefined | pid(),
     pin_rem :: undefined | {binary(), integer()},
-    cinfo :: undefined | map()
+    cinfo :: undefined | map(),
+    slot :: undefined | nist_piv:slot(),
+    chalbox :: undefined | ebox:box(),
+    chal :: undefined | #ebox_challenge{},
+    respbox :: undefined | ebox:box()
     }).
 
 %% @private
@@ -89,9 +97,19 @@ make_styles(Inst, {W, H}) ->
     ok = lv_style:set_bg_opa(Flex, 0),
     ok = lv_style:set_border_opa(Flex, 0),
 
+    {ok, Row} = lv_style:create(Inst),
+    ok = lv_style:set_flex_flow(Row, row),
+    ok = lv_style:set_flex_align(Row, center, start, start),
+    ok = lv_style:set_bg_opa(Row, 0),
+    ok = lv_style:set_border_opa(Row, 0),
+    ok = lv_style:set_width(Row, {percent, 100}),
+    ok = lv_style:set_height(Row, content),
+
     {ok, Group} = lv_style:create(Inst),
     ok = lv_style:set_bg_opa(Group, 0.7),
     ok = lv_style:set_border_opa(Group, 0),
+    ok = lv_style:set_width(Group, {percent, 100}),
+    ok = lv_style:set_height(Group, content),
 
     {ok, Divider} = lv_style:create(Inst),
     ok = lv_style:set_border_side(Divider, [left]),
@@ -102,7 +120,8 @@ make_styles(Inst, {W, H}) ->
     ok = lv_style:set_pad_bottom(Divider, 0),
     ok = lv_style:set_radius(Divider, 0),
 
-    #{screen => Scr, flex => Flex, group => Group, group_divider => Divider}.
+    #{screen => Scr, flex => Flex, group => Group, group_divider => Divider,
+      row => Row}.
 
 make_screen(#?MODULE{inst = Inst, sty = Sty, res = {W, H}}) ->
     #{screen := ScreenStyle, flex := FlexStyle} = Sty,
@@ -140,7 +159,6 @@ make_group(TopLevel, Symbol, #?MODULE{inst = Inst, sty = Sty}) ->
 
     {ok, Outer} = lv_obj:create(Inst, TopLevel),
     ok = lv_obj:add_style(Outer, GroupStyle),
-    ok = lv_obj:set_size(Outer, {{percent, 100}, content}),
 
     {ok, Sym} = lv_img:create(Outer),
     ok = lv_img:set_src(Sym, Symbol),
@@ -163,10 +181,36 @@ make_err_lbl(Parent, Fmt, Args) ->
         true -> Msg
     end,
     ok = lv_label:set_text(Lbl, MsgTrunc),
-    ok = lv_obj:set_style_text_color(Lbl, lv_color:make(16#FF6060)),
+    ok = lv_obj:set_style_text_color(Lbl, lv_color:darken(red, 2)),
     ok = lv_obj:center(Lbl).
 make_err_lbl(Parent, Fmt) ->
     make_err_lbl(Parent, Fmt, []).
+
+err_dialog(#?MODULE{inst = Inst}, Fmt, Args) ->
+    Msg = io_lib:format(Fmt, Args),
+    MsgLen = iolist_size(Msg),
+    MsgTrunc = if MsgLen > 512 ->
+        binary:part(iolist_to_binary(Msg), {0, 512});
+        true -> Msg
+    end,
+    {ok, Top} = lv_disp:get_layer_top(Inst),
+    {ok, MsgBox} = lv_msgbox:create(Top, "Error", MsgTrunc, ["Close",
+        "Exit"], false),
+    ok = lv_obj:set_size(MsgBox, {{percent, 20}, content}),
+    ok = lv_obj:center(MsgBox),
+    {ok, Event, Ref} = lv_event:setup(MsgBox, value_changed, err_dialog_done),
+    receive
+        {Ref, err_dialog_done} ->
+            {ok, Idx} = lv_msgbox:get_active_btn(MsgBox),
+            case Idx of
+                0 ->
+                    ok = lv_msgbox:close(MsgBox),
+                    ok;
+                1 ->
+                    disconnect
+            end
+    end.
+err_dialog(Inst, Fmt) -> err_dialog(Inst, Fmt, []).
 
 %% @private
 callback_mode() -> [state_functions, state_enter].
@@ -186,23 +230,33 @@ loading(enter, _PrevState, S0 = #?MODULE{}) ->
 loading(state_timeout, check, S0 = #?MODULE{srv = Srv}) ->
     case rdpivy_scard:open(Srv) of
         {ok, SC0} ->
-            {next_state, login, S0#?MODULE{scard = SC0}};
+            {next_state, get_chal, S0#?MODULE{scard = SC0}};
         _Err ->
             {keep_state_and_data, [{state_timeout, 1000, check}]}
     end.
 
 %% @private
-login(enter, _PrevState, S0 = #?MODULE{inst = Inst, scard = SC0}) ->
+login(enter, _PrevState, S0 = #?MODULE{inst = Inst, scard = SC0, sty = Sty}) ->
+    #{row := RowStyle} = Sty,
     {Screen, Flex} = make_screen(S0),
     {ok, InpGroup} = lv_group:create(Inst),
+
+    {ok, HdrLabel} = lv_label:create(Flex),
+    ok = lv_label:set_text(HdrLabel, "Select device"),
+    ok = lv_obj:set_style_text_font(HdrLabel, {"montserrat", regular, 22}),
+    ok = lv_obj:set_style_text_color(HdrLabel, lv_color:palette(white)),
 
     S1 = case rdpivy_scard:list_cards(SC0) of
         {ok, [], SC1} ->
             make_err_lbl(Screen, "No smartcard devices found"),
             S0#?MODULE{scard = SC1};
         {ok, Cards, SC1} ->
+            #?MODULE{chalbox = #ebox_box{unlock_key = UnlockKey}} = S0,
             Evts = lists:foldl(fun (CardInfo, Acc) ->
-                #{reader := RdrName, guid := Guid, upns := UPNs} = CardInfo,
+                #{reader := RdrName, guid := Guid} = CardInfo,
+
+                UPNMap = maps:get(upns, CardInfo, #{}),
+                UPNs = lists:flatten(maps:values(UPNMap)),
 
                 Group = make_group(Flex, sd_card, S0),
 
@@ -212,17 +266,17 @@ login(enter, _PrevState, S0 = #?MODULE{inst = Inst, scard = SC0}) ->
                     {"montserrat", regular, 20}),
 
                 <<GuidN:128/big>> = Guid,
-                GuidText = io_lib:format("~.16B", [GuidN]),
+                GuidText = io_lib:format("GUID = ~.16B", [GuidN]),
                 {ok, GuidLbl} = lv_label:create(Group),
                 ok = lv_label:set_text(GuidLbl, GuidText),
                 ok = lv_obj:set_style_text_font(GuidLbl,
-                    {"montserrat", regular, 10}),
+                    {"source code pro", regular, 10}),
                 ok = lv_obj:set_style_text_opa(GuidLbl, 0.8),
 
                 case UPNs of
                     [UPN | _] ->
                         {ok, UpnLbl} = lv_label:create(Group),
-                        ok = lv_label:set_text(UpnLbl, UPN);
+                        ok = lv_label:set_text(UpnLbl, ["\xEF\x81\x94 ", UPN]);
                     _ ->
                         ok
                 end,
@@ -230,46 +284,67 @@ login(enter, _PrevState, S0 = #?MODULE{inst = Inst, scard = SC0}) ->
                 case CardInfo of
                     #{yk_version := {Maj,Min,Pat}, yk_serial := Serial} ->
                         {ok, YkLbl} = lv_label:create(Group),
-                        Text = io_lib:format("YubiKey #~B, firmware v~B.~B.~B",
+                        Text = io_lib:format("\xEF\x8a\x87 YubiKey #~B, firmware v~B.~B.~B",
                             [Serial, Maj, Min, Pat]),
                         ok = lv_label:set_text(YkLbl, Text);
                     _ ->
                         ok
                 end,
 
-                {ok, PinText} = lv_textarea:create(Group),
-                ok = lv_textarea:set_one_line(PinText, true),
-                ok = lv_textarea:set_text_selection(PinText, true),
-                #?MODULE{pinchars = Chars} = S0,
-                ok = lv_textarea:set_placeholder_text(PinText, "PIN"),
-                ok = lv_textarea:set_accepted_chars(PinText, Chars),
-                ok = lv_textarea:set_password_mode(PinText, true),
-                ok = lv_group:add_obj(InpGroup, PinText),
+                PubKeys = maps:values(maps:get(public_keys, CardInfo, #{})),
+                Match = lists:any(fun (PubKey) ->
+                    case PubKey of
+                        UnlockKey -> true;
+                        _ -> false
+                    end
+                end, PubKeys),
 
-                case S0 of
-                    #?MODULE{pin_rem = {RdrName, Rem}} ->
-                        {ok, ErrLbl} = lv_label:create(Group),
-                        ErrText = io_lib:format(
-                            "Incorrect PIN. ~B attempts remaining.",
-                            [Rem]),
-                        ok = lv_label:set_text(ErrLbl, ErrText),
-                        ok = lv_obj:set_style_text_color(ErrLbl,
-                            lv_color:darken(red, 2)),
-                        ok = lv_group:focus_obj(PinText);
-                    _ ->
-                        ok
-                end,
+                case Match of
+                    true ->
+                        {ok, PinText} = lv_textarea:create(Group),
+                        ok = lv_textarea:set_one_line(PinText, true),
+                        ok = lv_textarea:set_text_selection(PinText, true),
+                        #?MODULE{pinchars = Chars} = S0,
+                        ok = lv_textarea:set_placeholder_text(PinText, "PIN"),
+                        ok = lv_textarea:set_accepted_chars(PinText, Chars),
+                        ok = lv_textarea:set_password_mode(PinText, true),
+                        ok = lv_group:add_obj(InpGroup, PinText),
 
-                {ok, YkBtn} = lv_btn:create(Group),
-                {ok, YkBtnLbl} = lv_label:create(YkBtn),
-                ok = lv_label:set_text(YkBtnLbl, "Login"),
+                        CAKValid = maps:get(piv_card_auth,
+                            maps:get(valid_certs, CardInfo, #{}), false),
+                        case CAKValid of
+                            true ->
+                                ok;
+                            false ->
+                                make_err_lbl(Group,
+                                    "\xEF\x81\xB1 Warning: could not verify CAK!\n"
+                                    "  Device is unsigned or may be fake!")
+                        end,
 
-                {ok, YkBtnEvent, _} = lv_event:setup(YkBtn, pressed,
-                    {login, CardInfo, PinText}),
-                {ok, YkAcEvent, _} = lv_event:setup(PinText, ready,
-                    {login, CardInfo, PinText}),
+                        case S0 of
+                            #?MODULE{pin_rem = {RdrName, Rem}} ->
+                                make_err_lbl(Group,
+                                    "\xEF\x81\xB1 Incorrect PIN. ~B attempts remaining.",
+                                    [Rem]),
+                                ok = lv_group:focus_obj(PinText);
+                            _ ->
+                                ok
+                        end,
 
-                [YkBtnEvent, YkAcEvent | Acc]
+                        {ok, YkBtn} = lv_btn:create(Group),
+                        {ok, YkBtnLbl} = lv_label:create(YkBtn),
+                        ok = lv_label:set_text(YkBtnLbl, "Login"),
+
+                        {ok, YkBtnEvent, _} = lv_event:setup(YkBtn, pressed,
+                            {login, CardInfo, PinText}),
+                        {ok, YkAcEvent, _} = lv_event:setup(PinText, ready,
+                            {login, CardInfo, PinText}),
+
+                        [YkBtnEvent, YkAcEvent | Acc];
+                    false ->
+                        make_err_lbl(Group, "No matching keys found."),
+                        Acc
+                end
             end, [], Cards),
             S0#?MODULE{scard = SC1, events = Evts};
         Err ->
@@ -296,21 +371,282 @@ login(info, {_, {login, CardInfo, PinText}}, S0 = #?MODULE{scard = SC0}) ->
 check_pin(enter, _PrevState, S0 = #?MODULE{}) ->
     Screen = make_waiting_screen("Checking PIN...", S0),
     {keep_state, S0#?MODULE{screen = Screen}, [{state_timeout, 0, check}]};
-check_pin(state_timeout, check, S0 = #?MODULE{piv = Piv, pin = PIN,
+check_pin(state_timeout, check, S0 = #?MODULE{piv = Piv, pin = PIN, cinfo = CI,
                                               scard = SC0}) ->
+    #{public_keys := PK} = CI,
     ok = apdu_transform:begin_transaction(Piv),
-    {ok, [{ok, #{version := V}}]} = apdu_transform:command(Piv, select),
+    {ok, [{ok, _}]} = apdu_transform:command(Piv, select),
+    case PK of
+        #{piv_card_auth := CAK} ->
+            Alg = nist_piv:algo_for_key(CAK),
+            Challenge = <<"rdpivy cak challenge", 0,
+                (crypto:strong_rand_bytes(16))/binary>>,
+            HashAlgo = case Alg of
+                rsa2048 -> sha256;
+                eccp256 -> sha256;
+                eccp384 -> sha384;
+                eccp521 -> sha512
+            end,
+            Hash = crypto:hash(HashAlgo, Challenge),
+            {ok, [{ok, CardSig}]} = apdu_transform:command(Piv, {sign,
+                piv_card_auth, Alg, Hash}),
+            true = public_key:verify(Challenge, HashAlgo, CardSig, CAK);
+        _ ->
+            ok
+    end,
     case apdu_transform:command(Piv, {verify_pin, piv_pin, PIN}) of
         {ok, [ok]} ->
-            apdu_transform:end_transaction(Piv),
-            {next_state, get_chal, S0};
+            {next_state, decrypt, S0};
         {ok, [{error, bad_auth, Attempts}]} ->
             #?MODULE{cinfo = #{reader := Rdr}} = S0,
             apdu_transform:end_transaction(Piv),
             {ok, SC1} = rdpdr_scard:disconnect(leave, SC0),
             {next_state, login, S0#?MODULE{pin_rem = {Rdr, Attempts},
                                            piv = undefined, pin = undefined,
-                                           scard = SC1}}
+                                           scard = SC1}};
+        Err ->
+            lager:debug("err = ~p", [Err]),
+            apdu_transform:end_transaction(Piv),
+            {stop, pin_failure, S0}
+    end.
+
+%% @private
+decrypt(enter, _PrevState, S0 = #?MODULE{}) ->
+    Screen = make_waiting_screen("Decrypting box...", S0),
+    {keep_state, S0#?MODULE{screen = Screen}, [{state_timeout, 0, decrypt}]};
+decrypt(state_timeout, decrypt, S0 = #?MODULE{piv = Piv, cinfo = CI,
+                                              chalbox = B0, scard = SC0}) ->
+    #{public_keys := PK} = CI,
+    #ebox_box{unlock_key = UnlockKey} = B0,
+    {value, {Slot, _}} = lists:search(fun
+        ({_Slot, PubKey}) when (PubKey =:= UnlockKey) -> true;
+        (_) -> false
+    end, maps:to_list(PK)),
+    S1 = S0#?MODULE{slot = Slot},
+    Res = ebox:decrypt_box(B0, {ebox_key_piv, {Piv, Slot, UnlockKey}}),
+    case Res of
+        {ok, B1} ->
+            Chal = ebox:decode_challenge(B1),
+            S2 = S1#?MODULE{chal = Chal},
+            {next_state, confirm, S2};
+        Err ->
+            apdu_transform:end_transaction(Piv, reset),
+            {ok, SC1} = rdpdr_scard:disconnect(leave, SC0),
+            lager:debug("decrypt box failed: ~p", [Err]),
+            case err_dialog(S0, "Decryption failed:\n~p", [Err]) of
+                ok ->
+                    {next_state, get_chal, S0#?MODULE{scard = SC1}};
+                disconnect ->
+                    #?MODULE{srv = Srv} = S0,
+                    rdp_server:close(Srv),
+                    {stop, normal, S0#?MODULE{scard = SC1}}
+            end
+    end.
+
+%% @private
+confirm(enter, _PrevState, S0 = #?MODULE{inst = Inst, sty = Sty, chal = Chal,
+                                         res = {W, _}}) ->
+    #ebox_challenge{type = Type, description = Descr, hostname = Hostname,
+                    created = CTime, words = Words} = Chal,
+
+    {Screen, Flex} = make_screen(S0),
+
+    #{group := GroupStyle, flex := FlexStyle, row := RowStyle} = Sty,
+    {ok, Outer} = lv_obj:create(Inst, Flex),
+    ok = lv_obj:add_style(Outer, FlexStyle),
+    ok = lv_obj:add_style(Outer, GroupStyle),
+
+    {ok, HdrLabel} = lv_label:create(Outer),
+    ok = lv_label:set_text(HdrLabel, "Confirm"),
+    ok = lv_obj:set_style_text_font(HdrLabel, {"montserrat", regular, 22}),
+
+    {ok, Tbl} = lv_table:create(Outer),
+    ok = lv_table:set_col_cnt(Tbl, 2),
+    ok = lv_table:set_col_width(Tbl, 0, (W div 3 - 80) div 4),
+    ok = lv_table:set_col_width(Tbl, 1, 3 * (W div 3 - 80) div 4),
+    ok = lv_table:set_row_cnt(Tbl, 4),
+    ok = lv_obj:set_size(Tbl, {{percent, 100}, content}),
+
+    ok = lv_table:set_cell_value(Tbl, 0, 0, "Purpose"),
+    TypeStr = case Type of
+        recovery -> "Recovery of at-rest encryption keys";
+        verify_audit -> "Verification of audit trail"
+    end,
+    ok = lv_table:set_cell_value(Tbl, 0, 1, TypeStr),
+
+    ok = lv_table:set_cell_value(Tbl, 1, 0, "Description"),
+    case Descr of
+        undefined -> ok;
+        _ ->         ok = lv_table:set_cell_value(Tbl, 1, 1, Descr)
+    end,
+
+    ok = lv_table:set_cell_value(Tbl, 2, 0, "Hostname"),
+    case Hostname of
+        undefined -> ok;
+        _ ->         ok = lv_table:set_cell_value(Tbl, 2, 1, Hostname)
+    end,
+
+    ok = lv_table:set_cell_value(Tbl, 3, 0, "Created at"),
+    case CTime of
+        undefined -> ok;
+        _ ->
+            CTimeStr = calendar:system_time_to_rfc3339(CTime, [{unit, second}]),
+            ok = lv_table:set_cell_value(Tbl, 3, 1, CTimeStr)
+    end,
+
+    {ok, WordsHdr} = lv_label:create(Outer),
+    ok = lv_label:set_text(WordsHdr, "VERIFICATION WORDS:"),
+    ok = lv_obj:set_style_text_font(WordsHdr, {"montserrat", regular, 18}),
+    ok = lv_obj:set_style_text_color(WordsHdr, lv_color:darken(red, 4)),
+
+    {ok, WordLbl} = lv_label:create(Outer),
+    ok = lv_label:set_text(WordLbl, lists:join("  ", Words)),
+    ok = lv_obj:set_style_text_font(WordLbl, {"montserrat", regular, 16}),
+    ok = lv_obj:set_style_text_color(WordLbl, lv_color:darken(red, 4)),
+
+    {ok, InsLabel} = lv_label:create(Outer),
+    ok = lv_label:set_text(InsLabel, "Check the details above carefully.\n"
+        "If they match the originator of the challenge, press Confirm."),
+    ok = lv_obj:set_style_pad_top(InsLabel, 30),
+
+    {ok, BtnRow} = lv_obj:create(Inst, Outer),
+    ok = lv_obj:add_style(BtnRow, RowStyle),
+
+    {ok, CBtn} = lv_btn:create(BtnRow),
+    {ok, CBtnLbl} = lv_label:create(CBtn),
+    ok = lv_label:set_text(CBtnLbl, "Confirm"),
+
+    {ok, XBtn} = lv_btn:create(BtnRow),
+    {ok, XBtnLbl} = lv_label:create(XBtn),
+    ok = lv_label:set_text(XBtnLbl, "Cancel"),
+    ok = lv_obj:set_style_bg_color(XBtn, lv_color:lighten(red, 2)),
+
+    {ok, CBtnEvt, _} = lv_event:setup(CBtn, pressed, confirm),
+    {ok, XBtnEvt, _} = lv_event:setup(XBtn, pressed, cancel),
+
+    ok = lv_scr:load_anim(Inst, Screen, fade_in, 500, 0, true),
+
+    {keep_state, S0#?MODULE{events = [CBtnEvt, XBtnEvt], screen = Screen}};
+
+confirm(info, {_, cancel}, S0 = #?MODULE{srv = Srv, piv = Piv, scard = SC0}) ->
+    apdu_transform:end_transaction(Piv, reset),
+    {ok, SC1} = rdpdr_scard:disconnect(leave, SC0),
+    rdp_server:close(Srv),
+    {stop, normal, S0#?MODULE{scard = SC1}};
+
+confirm(info, {_, confirm}, S0 = #?MODULE{}) ->
+    {next_state, decrypt_key, S0}.
+
+%% @private
+decrypt_key(enter, _PrevState, S0 = #?MODULE{}) ->
+    Screen = make_waiting_screen("Decrypting key piece...", S0),
+    {keep_state, S0#?MODULE{screen = Screen}, [{state_timeout, 0, decrypt}]};
+decrypt_key(state_timeout, decrypt, S0 = #?MODULE{piv = Piv, cinfo = CI,
+                                                  chal = Chal, slot = Slot,
+                                                  scard = SC0}) ->
+    #ebox_challenge{keybox = KB0} = Chal,
+    #ebox_box{unlock_key = UnlockKey} = KB0,
+    Res = ebox:decrypt_box(KB0, {ebox_key_piv, {Piv, Slot, UnlockKey}}),
+    apdu_transform:end_transaction(Piv, reset),
+    {ok, SC1} = rdpdr_scard:disconnect(leave, SC0),
+    case Res of
+        {ok, KB1} ->
+            Resp = ebox:response_box(Chal, KB1),
+            S1 = S0#?MODULE{respbox = Resp, scard = SC1},
+            {next_state, response, S1};
+        Err ->
+            lager:debug("decrypt key box failed: ~p", [Err]),
+            case err_dialog(S0, "Decryption failed:\n~p", [Err]) of
+                ok ->
+                    {next_state, get_chal, S0#?MODULE{scard = SC1}};
+                disconnect ->
+                    #?MODULE{srv = Srv} = S0,
+                    rdp_server:close(Srv),
+                    {stop, normal, S0#?MODULE{scard = SC1}}
+            end
+    end.
+
+wrap70(<<Line:60/binary, Rest/binary>>) ->
+    [[Line, $\n] | wrap70(Rest)];
+wrap70(Rest) -> [Rest, $\n].
+
+%% @private
+response(enter, _PrevState, S0 = #?MODULE{respbox = RB, sty = Sty, inst = Inst}) ->
+    Data = ebox:encode(RB),
+    Base64 = base64:encode(Data),
+    Lines = wrap70(Base64),
+    Resp = ["-- Begin response --\n", Lines, "-- End response --\n"],
+
+    {Screen, Flex} = make_screen(S0),
+
+    #{group := GroupStyle, flex := FlexStyle, row := RowStyle} = Sty,
+    {ok, Outer} = lv_obj:create(Inst, Flex),
+    ok = lv_obj:add_style(Outer, FlexStyle),
+    ok = lv_obj:add_style(Outer, GroupStyle),
+
+    {ok, HdrLabel} = lv_label:create(Outer),
+    ok = lv_label:set_text(HdrLabel, "Response"),
+    ok = lv_obj:set_style_text_font(HdrLabel, {"montserrat", regular, 22}),
+
+    {ok, RespTxt} = lv_textarea:create(Outer),
+    ok = lv_obj:set_size(RespTxt, {{percent, 100}, 500}),
+    ok = lv_obj:set_style_text_font(RespTxt, {"source code pro", regular, 12}),
+    ok = lv_textarea:set_text(RespTxt, Resp),
+
+    {ok, BtnRow} = lv_obj:create(Inst, Outer),
+    ok = lv_obj:add_style(BtnRow, RowStyle),
+
+    {ok, CBtn} = lv_btn:create(BtnRow),
+    {ok, CBtnLbl} = lv_label:create(CBtn),
+    ok = lv_label:set_text(CBtnLbl, "Copy to clipboard"),
+
+    {ok, XBtn} = lv_btn:create(BtnRow),
+    {ok, XBtnLbl} = lv_label:create(XBtn),
+    ok = lv_label:set_text(XBtnLbl, "Exit"),
+    ok = lv_obj:set_style_bg_color(XBtn, lv_color:lighten(red, 2)),
+
+    {ok, CBtnEvt, _} = lv_event:setup(CBtn, pressed, {copy, Resp, CBtn}),
+    {ok, XBtnEvt, _} = lv_event:setup(XBtn, pressed, exit),
+
+    ok = lv_scr:load_anim(Inst, Screen, fade_in, 500, 0, true),
+
+    {keep_state, S0#?MODULE{events = [CBtnEvt, XBtnEvt], screen = Screen}};
+
+response(info, {_, exit}, S0 = #?MODULE{srv = Srv}) ->
+    rdp_server:close(Srv),
+    {stop, normal, S0};
+
+response(info, {_, {copy, Data, Btn}}, S0 = #?MODULE{srv = Srv}) ->
+    {ok, Spinner} = lv_spinner:create(Btn, 90, 1000),
+    ok = lv_obj:set_size(Spinner, {30, 30}),
+    case rdp_server:get_vchan_pid(Srv, cliprdr_fsm) of
+        {ok, ClipRdr} ->
+            Formats = #{
+                text => Data,
+                unicode => unicode:characters_to_binary(Data, utf8, {utf16,little})
+            },
+            case cliprdr_fsm:copy(ClipRdr, Formats) of
+                ok ->
+                    ok = lv_obj:add_state(Btn, checked),
+                    lv_obj:del(Spinner),
+                    keep_state_and_data;
+                Err ->
+                    case err_dialog(S0, "Copy failed:\n~p", [Err]) of
+                        ok ->
+                            keep_state_and_data;
+                        disconnect ->
+                            rdp_server:close(Srv),
+                            {stop, normal, S0}
+                    end
+            end;
+        _ ->
+            case err_dialog(S0, "Clipboard redirection not enabled") of
+                ok ->
+                    keep_state_and_data;
+                disconnect ->
+                    rdp_server:close(Srv),
+                    {stop, normal, S0}
+            end
     end.
 
 %% @private
@@ -322,15 +658,15 @@ get_chal(enter, _PrevState, S0 = #?MODULE{inst = Inst, sty = Sty}) ->
     {ok, Outer} = lv_obj:create(Inst, Flex),
     ok = lv_obj:add_style(Outer, FlexStyle),
     ok = lv_obj:add_style(Outer, GroupStyle),
-    ok = lv_obj:set_size(Outer, {{percent, 100}, content}),
 
     {ok, HdrLabel} = lv_label:create(Outer),
-    ok = lv_label:set_text(HdrLabel, "Challenge/response"),
+    ok = lv_label:set_text(HdrLabel, "pivy-box challenge-response"),
     ok = lv_obj:set_style_text_font(HdrLabel, {"montserrat", regular, 22}),
 
     {ok, ChalInp} = lv_textarea:create(Outer),
     ok = lv_textarea:set_text_selection(ChalInp, true),
     ok = lv_textarea:set_placeholder_text(ChalInp, "Paste challenge here"),
+    ok = lv_obj:set_style_text_font(ChalInp, {"source code pro", regular, 12}),
     ok = lv_obj:set_size(ChalInp, {{percent, 100}, 500}),
     ok = lv_group:add_obj(InpGroup, ChalInp),
 
@@ -345,12 +681,11 @@ get_chal(enter, _PrevState, S0 = #?MODULE{inst = Inst, sty = Sty}) ->
 
     ok = lv_scr:load_anim(Inst, Screen, fade_in, 500, 0, true),
     ok = lv_indev:set_group(Inst, keyboard, InpGroup),
-    {keep_state, S0#?MODULE{screen = Flex, events = [BtnEvent, AcEvent]}};
+    {keep_state, S0#?MODULE{screen = Screen, events = [BtnEvent, AcEvent]}};
 
-get_chal(info, {_, {submit, ChalInp}}, S0 = #?MODULE{inst = Inst, screen = Scr}) ->
+get_chal(info, {_, {submit, ChalInp}}, S0 = #?MODULE{inst = Inst}) ->
     {ok, Data} = lv_textarea:get_text(ChalInp),
     Lines0 = binary:split(Data, [<<"\r\n">>, <<"\n">>], [global]),
-    lager:debug("lines = ~p", [Lines0]),
     Lines1 = lists:filter(fun
         (<<"--", _/binary>>) -> false;
         (_) -> true
@@ -359,18 +694,30 @@ get_chal(info, {_, {submit, ChalInp}}, S0 = #?MODULE{inst = Inst, screen = Scr})
         re:replace(Line, "[^-A-Za-z0-9+/=]", "", [global])
     end, Lines1),
     Base64 = iolist_to_binary(Lines2),
-    lager:debug("base64 = ~s", [Base64]),
     case (catch base64:decode(Base64)) of
         {'EXIT', Why} ->
-            make_err_lbl(Scr, "Base64 error: ~p", [Why]),
-            keep_state_and_data;
+            #?MODULE{srv = Srv} = S0,
+            case err_dialog(S0, "Base64 decoding failed:\n~p", [Why]) of
+                ok ->
+                    keep_state_and_data;
+                disconnect ->
+                    #?MODULE{srv = Srv} = S0,
+                    rdp_server:close(Srv),
+                    {stop, normal, S0}
+            end;
         DataBin ->
             case (catch ebox:decode(DataBin)) of
                 {'EXIT', Why} ->
-                    make_err_lbl(Scr, "Ebox decode error: ~p", [Why]),
-                    keep_state_and_data;
-                B0 = #ebox_box{unlock_key = {Point, Curve}} ->
-                    make_err_lbl(Scr, "decode ok"),
-                    keep_state_and_data
+                    case err_dialog(S0, "Ebox decoding failed:\n~p", [Why]) of
+                        ok ->
+                            keep_state_and_data;
+                        disconnect ->
+                            #?MODULE{srv = Srv} = S0,
+                            rdp_server:close(Srv),
+                            {stop, normal, S0}
+                    end;
+                B0 = #ebox_box{} ->
+                    S1 = S0#?MODULE{chalbox = B0},
+                    {next_state, login, S1}
             end
     end.

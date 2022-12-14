@@ -41,11 +41,14 @@
     connect/2
     ]).
 
+-type slot() :: nist_piv:slot().
+
 -type card() :: #{
     guid => binary(),
     yk_version => {integer(), integer(), integer()},
     yk_serial => integer(),
-    upns => [string()],
+    upns => #{slot() => [string()]},
+    public_keys => #{slot() => ebox:pubkey()},
     reader => binary()
 }.
 
@@ -146,30 +149,146 @@ get_rdr_info(Rdr, Mode, SC0) ->
         _ ->
             Info1
     end,
-    Info3 = Info2#{upns => get_card_upns(Piv)},
-    lager:debug("info = ~p", [Info3]),
+    Info3 = get_card_cert_info(Piv, Info2),
     apdu_transform:end_transaction(Piv),
     {ok, Info3}.
 
 -define('szOID_NT_PRINCIPAL_NAME', {1,3,6,1,4,1,311,20,2,3}).
 
-get_card_upns(Piv) ->
-    get_card_upns([piv_auth, piv_sign, {retired, 1}, {retired, 2}], Piv).
-get_card_upns([], Piv) -> [];
-get_card_upns([Slot | Rest], Piv) ->
+get_card_cert_info(Piv, I0) ->
+    Slots0 = [piv_card_auth, piv_auth, piv_sign, piv_key_mgmt],
+    Slots1 = case apdu_transform:command(Piv, read_keyhist) of
+        {ok, #{on_card_certs := N}} ->
+            Slots0 ++ [{retired, N} || N <- lists:seq(1, N)];
+        _ ->
+            Slots0
+    end,
+    get_card_cert_info(Piv, Slots1, I0).
+
+atomize_curve({namedCurve, secp256r1}) -> {namedCurve, secp256r1};
+atomize_curve({namedCurve, ?'secp256r1'}) -> {namedCurve, secp256r1};
+atomize_curve({namedCurve, secp384r1}) -> {namedCurve, secp384r1};
+atomize_curve({namedCurve, ?'secp384r1'}) -> {namedCurve, secp384r1};
+atomize_curve({namedCurve, secp521r1}) -> {namedCurve, secp521r1};
+atomize_curve({namedCurve, ?'secp521r1'}) -> {namedCurve, secp521r1}.
+
+get_card_cert_info(Piv, [], I0) -> I0;
+get_card_cert_info(Piv, [Slot | Rest], I0) ->
     case apdu_transform:command(Piv, {read_cert, Slot}) of
         {ok, [{ok, Cert}]} ->
             #'OTPCertificate'{tbsCertificate = TBS} = Cert,
-            #'OTPTBSCertificate'{extensions = Exts} = TBS,
-            SANExts = [E || E = #'Extension'{extnID = ID} <- Exts, ID =:= ?'id-ce-subjectAltName'],
-            case SANExts of
+            #'OTPTBSCertificate'{subjectPublicKeyInfo = SPKI,
+                                 extensions = Exts} = TBS,
+            #'OTPSubjectPublicKeyInfo'{algorithm = PKA,
+                                       subjectPublicKey = SPK} = SPKI,
+            PubKey = case PKA of
+                #'PublicKeyAlgorithm'{algorithm = ?'id-ecPublicKey',
+                                      parameters = Curve = {namedCurve, _}} ->
+                    ebox_crypto:compress({SPK, atomize_curve(Curve)});
+                #'PublicKeyAlgorithm'{algorithm = ?'rsaEncryption'} ->
+                    SPK
+            end,
+            PK0 = maps:get(public_keys, I0, #{}),
+            PK1 = PK0#{Slot => PubKey},
+            SANExts = [E || E = #'Extension'{extnID = ID} <- Exts,
+                            ID =:= ?'id-ce-subjectAltName'],
+            UPN0 = maps:get(upns, I0, #{}),
+            UPN1 = case SANExts of
                 [#'Extension'{extnValue = SANs}] ->
                     Ders = [V || {otherName, #'AnotherName'{'type-id' = ?'szOID_NT_PRINCIPAL_NAME', value = V}} <- SANs],
                     Tlvs = [asn1rt_nif:decode_ber_tlv(Der) || Der <- Ders],
-                    [Str || {{_Tag, Str}, <<>>} <- Tlvs, is_binary(Str)] ++ get_card_upns(Rest, Piv);
+                    UPNs = [Str || {{_Tag, Str}, <<>>} <- Tlvs, is_binary(Str)],
+                    UPN0#{Slot => UPNs};
                 _ ->
-                    get_card_upns(Rest, Piv)
-            end;
+                    UPN0
+            end,
+            Valid0 = maps:get(valid_certs, I0, #{}),
+            Valid1 = case (catch check_cert(Cert)) of
+                {'EXIT', Why} ->
+                    Valid0;
+                _ ->
+                    Valid0#{Slot => true}
+            end,
+            I1 = I0#{public_keys => PK1, upns => UPN1, valid_certs => Valid1},
+            get_card_cert_info(Piv, Rest, I1);
         _Err ->
-            get_card_upns(Rest, Piv)
+            get_card_cert_info(Piv, Rest, I0)
     end.
+
+fetch_dp_and_crls(Cert) ->
+    DPs = public_key:pkix_dist_points(Cert),
+    fetch_dps(DPs).
+
+fetch_dps([DP = #'DistributionPoint'{distributionPoint = {fullName, Names}} | Rest]) ->
+    fetch_dp_names(DP, Names) ++ fetch_dps(Rest);
+fetch_dps([_ | Rest]) ->
+    fetch_dps(Rest);
+fetch_dps([]) -> [].
+
+fetch_dp_names(DP, [{uniformResourceIdentifier, "http"++_ = URL} | Rest]) ->
+    case httpc:request(get, {URL, [{"connection", "close"}]},
+                       [{timeout, 1000}], [{body_format, binary}]) of
+        {ok, {_Status, _Headers, Body}} ->
+            case (catch public_key:der_decode('CertificateList', Body)) of
+                {'EXIT', _} ->
+                    case (catch public_key:pem_decode(Body)) of
+                        {'EXIT', _} -> fetch_dp_names(DP, Rest);
+                        [] -> fetch_dp_names(DP, Rest);
+                        CLs ->
+                            [{DP, {D, public_key:der_decode('CertificateList', D)},
+                                  {D, public_key:der_decode('CertificateList', D)}}
+                             || {'CertificateList', D, not_encrypted} <- CLs]
+                            ++ fetch_dp_names(DP, Rest)
+                    end;
+                CL = #'CertificateList'{} ->
+                    [{DP, {Body, CL}, {Body, CL}} | fetch_dp_names(DP, Rest)]
+            end;
+        _ ->
+            fetch_dp_names(DP, Rest)
+    end;
+fetch_dp_names(DP, [_ | Rest]) ->
+    fetch_dp_names(DP, Rest);
+fetch_dp_names(_DP, []) -> [].
+
+find_ca([], Cert = #'OTPCertificate'{tbsCertificate = TBS}) ->
+    #'OTPTBSCertificate'{issuer = {rdnSequence, Issuer}} = TBS,
+    error({unknown_ca, Issuer});
+find_ca([], _Cert) ->
+    error(unknown_ca);
+find_ca([CA | Rest], Cert) ->
+    case public_key:pkix_is_issuer(Cert, CA) of
+        true -> CA;
+        false -> find_ca(Rest, Cert)
+    end.
+
+check_cert(Cert) ->
+    DPandCRLs = fetch_dp_and_crls(Cert),
+    CACertPath = application:get_env(rdpivy, ca_certs, "/etc/ssl/cert.pem"),
+    {ok, CAData} = file:read_file(CACertPath),
+    Entries0 = public_key:pem_decode(CAData),
+    Entries1 = lists:foldl(fun
+        ({'Certificate',E,_}, Acc) ->
+            case (catch public_key:pkix_decode_cert(E, otp)) of
+                {'EXIT', _} -> Acc;
+                C = #'OTPCertificate'{} -> [C | Acc]
+            end;
+        (_, Acc) -> Acc
+    end, [], Entries0),
+    CA = find_ca(Entries1, Cert),
+    Opts = [],
+    {ok, _} = public_key:pkix_path_validation(CA, [Cert], Opts),
+    CRLOpts = [
+        {issuer_fun, {fun (_DP, CL, _Name, none) ->
+            {ok, find_ca(Entries1, CL), []}
+        end, none}}
+    ],
+    valid = public_key:pkix_crls_validate(Cert, DPandCRLs, CRLOpts).
+
+challenge_slot(Piv, Slot, PubKey) ->
+    Algo = nist_piv:algo_for_key(PubKey),
+    Challenge = <<"rdpivy cak challenge", 0,
+        (crypto:strong_rand_bytes(16))/binary>>,
+    Hash = crypto:hash(sha256, Challenge),
+    {ok, [{ok, CardSig}]} = apdu_transform:command(Piv, {sign, Slot,
+        Algo, Hash}),
+    true = public_key:verify(Challenge, sha256, CardSig, PubKey).
