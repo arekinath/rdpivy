@@ -237,6 +237,8 @@ loading(state_timeout, check, S0 = #?MODULE{srv = Srv}) ->
 
 %% @private
 login(enter, _PrevState, S0 = #?MODULE{inst = Inst, scard = SC0, sty = Sty}) ->
+    WaitScreen = make_waiting_screen("Looking for smartcard devices...", S0),
+
     #{row := RowStyle} = Sty,
     {Screen, Flex} = make_screen(S0),
     {ok, InpGroup} = lv_group:create(Inst),
