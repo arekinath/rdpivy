@@ -99,9 +99,13 @@ make_styles(Inst, {W, H}) ->
 
     {ok, Row} = lv_style:create(Inst),
     ok = lv_style:set_flex_flow(Row, row),
-    ok = lv_style:set_flex_align(Row, center, start, start),
+    ok = lv_style:set_flex_align(Row, start, center, center),
     ok = lv_style:set_bg_opa(Row, 0),
     ok = lv_style:set_border_opa(Row, 0),
+    ok = lv_style:set_pad_top(Row, 0),
+    ok = lv_style:set_pad_bottom(Row, 0),
+    ok = lv_style:set_pad_left(Row, 0),
+    ok = lv_style:set_pad_right(Row, 0),
     ok = lv_style:set_width(Row, {percent, 100}),
     ok = lv_style:set_height(Row, content),
 
@@ -656,7 +660,7 @@ get_chal(enter, _PrevState, S0 = #?MODULE{inst = Inst, sty = Sty}) ->
     {Screen, Flex} = make_screen(S0),
     {ok, InpGroup} = lv_group:create(Inst),
 
-    #{group := GroupStyle, flex := FlexStyle} = Sty,
+    #{group := GroupStyle, flex := FlexStyle, row := RowStyle} = Sty,
     {ok, Outer} = lv_obj:create(Inst, Flex),
     ok = lv_obj:add_style(Outer, FlexStyle),
     ok = lv_obj:add_style(Outer, GroupStyle),
@@ -672,18 +676,69 @@ get_chal(enter, _PrevState, S0 = #?MODULE{inst = Inst, sty = Sty}) ->
     ok = lv_obj:set_size(ChalInp, {{percent, 100}, 500}),
     ok = lv_group:add_obj(InpGroup, ChalInp),
 
-    {ok, Btn} = lv_btn:create(Outer),
+    {ok, BtnRow} = lv_obj:create(Inst, Outer),
+    ok = lv_obj:add_style(BtnRow, RowStyle),
+
+    {ok, Btn} = lv_btn:create(BtnRow),
     {ok, BtnLbl} = lv_label:create(Btn),
     ok = lv_label:set_text(BtnLbl, "Submit"),
+
+    {ok, PBtn} = lv_btn:create(BtnRow),
+    {ok, PBtnLbl} = lv_label:create(PBtn),
+    ok = lv_label:set_text(PBtnLbl, "Paste clipboard"),
 
     {ok, BtnEvent, _} = lv_event:setup(Btn, pressed,
         {submit, ChalInp}),
     {ok, AcEvent, _} = lv_event:setup(ChalInp, ready,
         {submit, ChalInp}),
+    {ok, PstEvent, _} = lv_event:setup(PBtn, pressed,
+        {paste_into, ChalInp}),
 
     ok = lv_scr:load_anim(Inst, Screen, fade_in, 500, 0, true),
     ok = lv_indev:set_group(Inst, keyboard, InpGroup),
-    {keep_state, S0#?MODULE{screen = Screen, events = [BtnEvent, AcEvent]}};
+    {keep_state, S0#?MODULE{screen = Screen, events = [BtnEvent, AcEvent,
+        PstEvent]}};
+
+get_chal(info, {_, {paste_into, Inp}}, S0 = #?MODULE{srv = Srv}) ->
+    case rdp_server:get_vchan_pid(Srv, cliprdr_fsm) of
+        {ok, ClipRdr} ->
+            case cliprdr_fsm:list_formats(ClipRdr) of
+                {ok, Fmts} ->
+                    Fmt = case lists:member(unicode, Fmts) of
+                        true -> unicode;
+                        false -> text
+                    end,
+                    case cliprdr_fsm:paste(ClipRdr, Fmt) of
+                        {ok, Data} ->
+                            ok = lv_textarea:set_text(Inp, Data),
+                            keep_state_and_data;
+                        Err ->
+                            case err_dialog(S0, "Paste failed:\n~p", [Err]) of
+                                ok ->
+                                    keep_state_and_data;
+                                disconnect ->
+                                    rdp_server:close(Srv),
+                                    {stop, normal, S0}
+                            end
+                    end;
+                Err ->
+                    case err_dialog(S0, "Paste failed:\n~p", [Err]) of
+                        ok ->
+                            keep_state_and_data;
+                        disconnect ->
+                            rdp_server:close(Srv),
+                            {stop, normal, S0}
+                    end
+            end;
+        _ ->
+            case err_dialog(S0, "Clipboard redirection not enabled") of
+                ok ->
+                    keep_state_and_data;
+                disconnect ->
+                    rdp_server:close(Srv),
+                    {stop, normal, S0}
+            end
+    end;
 
 get_chal(info, {_, {submit, ChalInp}}, S0 = #?MODULE{inst = Inst}) ->
     {ok, Data} = lv_textarea:get_text(ChalInp),
