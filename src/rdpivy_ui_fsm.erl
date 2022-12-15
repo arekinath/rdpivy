@@ -438,7 +438,7 @@ check_pin(state_timeout, check, S0 = #?MODULE{pin = PIN, cinfo = CI,
 
 %% @private
 decrypt(enter, _PrevState, S0 = #?MODULE{}) ->
-    Screen = make_waiting_screen("Decrypting box...", S0),
+    Screen = make_waiting_screen("Decrypting box...\nTouch may be required!", S0),
     {keep_state, S0#?MODULE{screen = Screen}, [{state_timeout, 0, decrypt}]};
 decrypt(state_timeout, decrypt, S0 = #?MODULE{piv = Piv, cinfo = CI,
                                               chalbox = B0}) ->
@@ -568,7 +568,7 @@ confirm(info, {_, confirm}, S0 = #?MODULE{}) ->
 
 %% @private
 decrypt_key(enter, _PrevState, S0 = #?MODULE{}) ->
-    Screen = make_waiting_screen("Decrypting key piece...", S0),
+    Screen = make_waiting_screen("Decrypting key piece...\nTouch may be required!", S0),
     {keep_state, S0#?MODULE{screen = Screen}, [{state_timeout, 0, decrypt}]};
 decrypt_key(state_timeout, decrypt, S0 = #?MODULE{piv = Piv, cinfo = CI,
                                                   chal = Chal, slot = Slot}) ->
