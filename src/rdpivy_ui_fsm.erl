@@ -74,7 +74,8 @@ start_link(Srv, Inst, Res) ->
     slot :: undefined | nist_piv:slot(),
     chalbox :: undefined | ebox:box(),
     chal :: undefined | #ebox_challenge{},
-    respbox :: undefined | ebox:box()
+    respbox :: undefined | ebox:box(),
+    after_check = decrypt :: atom()
     }).
 
 %% @private
@@ -83,6 +84,7 @@ init([Srv, Inst, {W, H}]) ->
     {ok, Chars} = lv:make_buffer(Inst, "0123456789"),
     S0 = #?MODULE{srv = Srv, inst = Inst, res = {W, H}, sty = Sty,
                   pinchars = Chars},
+    process_flag(trap_exit, true),
     {ok, loading, S0}.
 
 make_styles(Inst, {W, H}) ->
@@ -372,15 +374,34 @@ login(info, {_, {login, CardInfo, PinText}}, S0 = #?MODULE{scard = SC0}) ->
     {next_state, check_pin, S0#?MODULE{piv = Piv, scard = SC1, pin = PIN,
         screen = Screen, cinfo = CardInfo}}.
 
+begin_txn(S0 = #?MODULE{piv = Piv, scard = SC0, cinfo = CI}) ->
+    case apdu_transform:begin_transaction(Piv) of
+        ok ->
+            {ok, Piv, S0};
+        {error, {scard, 16#80100068}} ->
+            #{reader := Rdr} = CI,
+            {ok, SC1} = rdpdr_scard:disconnect(leave, SC0),
+            exit(Piv, kill),
+            receive {'EXIT', Piv, _} -> ok end,
+            {ok, Piv2, SC2} = rdpivy_scard:connect(Rdr, SC1),
+            S1 = S0#?MODULE{piv = Piv2, scard = SC2},
+            {ok, Piv2, S1}
+    end.
+
+disconnect(S0 = #?MODULE{piv = Piv, scard = SC0}) ->
+    {ok, SC1} = rdpdr_scard:disconnect(leave, SC0),
+    exit(Piv, kill),
+    receive {'EXIT', Piv, _} -> ok end,
+    S0#?MODULE{piv = undefined, scard = SC1}.
 
 %% @private
 check_pin(enter, _PrevState, S0 = #?MODULE{}) ->
     Screen = make_waiting_screen("Checking PIN...", S0),
     {keep_state, S0#?MODULE{screen = Screen}, [{state_timeout, 0, check}]};
-check_pin(state_timeout, check, S0 = #?MODULE{piv = Piv, pin = PIN, cinfo = CI,
-                                              scard = SC0}) ->
+check_pin(state_timeout, check, S0 = #?MODULE{pin = PIN, cinfo = CI,
+                                              after_check = St}) ->
     #{public_keys := PK} = CI,
-    ok = apdu_transform:begin_transaction(Piv),
+    {ok, Piv, S1} = begin_txn(S0),
     {ok, [{ok, _}]} = apdu_transform:command(Piv, select),
     case PK of
         #{piv_card_auth := CAK} ->
@@ -402,18 +423,17 @@ check_pin(state_timeout, check, S0 = #?MODULE{piv = Piv, pin = PIN, cinfo = CI,
     end,
     case apdu_transform:command(Piv, {verify_pin, piv_pin, PIN}) of
         {ok, [ok]} ->
-            {next_state, decrypt, S0};
+            {next_state, St, S1};
         {ok, [{error, bad_auth, Attempts}]} ->
-            #?MODULE{cinfo = #{reader := Rdr}} = S0,
+            #?MODULE{cinfo = #{reader := Rdr}} = S1,
             apdu_transform:end_transaction(Piv),
-            {ok, SC1} = rdpdr_scard:disconnect(leave, SC0),
-            {next_state, login, S0#?MODULE{pin_rem = {Rdr, Attempts},
-                                           piv = undefined, pin = undefined,
-                                           scard = SC1}};
+            S2 = disconnect(S1),
+            {next_state, login, S2#?MODULE{pin_rem = {Rdr, Attempts},
+                                           pin = undefined}};
         Err ->
             lager:debug("err = ~p", [Err]),
             apdu_transform:end_transaction(Piv),
-            {stop, pin_failure, S0}
+            {stop, pin_failure, disconnect(S1)}
     end.
 
 %% @private
@@ -421,7 +441,7 @@ decrypt(enter, _PrevState, S0 = #?MODULE{}) ->
     Screen = make_waiting_screen("Decrypting box...", S0),
     {keep_state, S0#?MODULE{screen = Screen}, [{state_timeout, 0, decrypt}]};
 decrypt(state_timeout, decrypt, S0 = #?MODULE{piv = Piv, cinfo = CI,
-                                              chalbox = B0, scard = SC0}) ->
+                                              chalbox = B0}) ->
     #{public_keys := PK} = CI,
     #ebox_box{unlock_key = UnlockKey} = B0,
     {value, {Slot, _}} = lists:search(fun
@@ -430,22 +450,22 @@ decrypt(state_timeout, decrypt, S0 = #?MODULE{piv = Piv, cinfo = CI,
     end, maps:to_list(PK)),
     S1 = S0#?MODULE{slot = Slot},
     Res = ebox:decrypt_box(B0, {ebox_key_piv, {Piv, Slot, UnlockKey}}),
+    apdu_transform:end_transaction(Piv, reset),
     case Res of
         {ok, B1} ->
             Chal = ebox:decode_challenge(B1),
             S2 = S1#?MODULE{chal = Chal},
             {next_state, confirm, S2};
         Err ->
-            apdu_transform:end_transaction(Piv, reset),
-            {ok, SC1} = rdpdr_scard:disconnect(leave, SC0),
+            S2 = disconnect(S1),
             lager:debug("decrypt box failed: ~p", [Err]),
-            case err_dialog(S0, "Decryption failed:\n~p", [Err]) of
+            case err_dialog(S2, "Decryption failed:\n~p", [Err]) of
                 ok ->
-                    {next_state, get_chal, S0#?MODULE{scard = SC1}};
+                    {next_state, get_chal, S2};
                 disconnect ->
-                    #?MODULE{srv = Srv} = S0,
+                    #?MODULE{srv = Srv} = S2,
                     rdp_server:close(Srv),
-                    {stop, normal, S0#?MODULE{scard = SC1}}
+                    {stop, normal, S2}
             end
     end.
 
@@ -534,41 +554,43 @@ confirm(enter, _PrevState, S0 = #?MODULE{inst = Inst, sty = Sty, chal = Chal,
 
     {keep_state, S0#?MODULE{events = [CBtnEvt, XBtnEvt], screen = Screen}};
 
-confirm(info, {_, cancel}, S0 = #?MODULE{srv = Srv, piv = Piv, scard = SC0}) ->
-    apdu_transform:end_transaction(Piv, reset),
-    {ok, SC1} = rdpdr_scard:disconnect(leave, SC0),
+confirm(info, {'EXIT', Pid, _Why}, S0 = #?MODULE{piv = Pid}) ->
+    {keep_state, S0#?MODULE{piv = undefined}};
+confirm(info, {'EXIT', _Pid, _Why}, _S0 = #?MODULE{}) ->
+    keep_state_and_data;
+
+confirm(info, {_, cancel}, S0 = #?MODULE{srv = Srv}) ->
     rdp_server:close(Srv),
-    {stop, normal, S0#?MODULE{scard = SC1}};
+    {stop, normal, disconnect(S0)};
 
 confirm(info, {_, confirm}, S0 = #?MODULE{}) ->
-    {next_state, decrypt_key, S0}.
+    {next_state, check_pin, S0#?MODULE{after_check = decrypt_key}}.
 
 %% @private
 decrypt_key(enter, _PrevState, S0 = #?MODULE{}) ->
     Screen = make_waiting_screen("Decrypting key piece...", S0),
     {keep_state, S0#?MODULE{screen = Screen}, [{state_timeout, 0, decrypt}]};
 decrypt_key(state_timeout, decrypt, S0 = #?MODULE{piv = Piv, cinfo = CI,
-                                                  chal = Chal, slot = Slot,
-                                                  scard = SC0}) ->
+                                                  chal = Chal, slot = Slot}) ->
     #ebox_challenge{keybox = KB0} = Chal,
     #ebox_box{unlock_key = UnlockKey} = KB0,
     Res = ebox:decrypt_box(KB0, {ebox_key_piv, {Piv, Slot, UnlockKey}}),
     apdu_transform:end_transaction(Piv, reset),
-    {ok, SC1} = rdpdr_scard:disconnect(leave, SC0),
+    S1 = disconnect(S0),
     case Res of
         {ok, KB1} ->
             Resp = ebox:response_box(Chal, KB1),
-            S1 = S0#?MODULE{respbox = Resp, scard = SC1},
-            {next_state, response, S1};
+            S2 = S1#?MODULE{respbox = Resp},
+            {next_state, response, S2};
         Err ->
             lager:debug("decrypt key box failed: ~p", [Err]),
-            case err_dialog(S0, "Decryption failed:\n~p", [Err]) of
+            case err_dialog(S1, "Decryption failed:\n~p", [Err]) of
                 ok ->
-                    {next_state, get_chal, S0#?MODULE{scard = SC1}};
+                    {next_state, get_chal, S1};
                 disconnect ->
                     #?MODULE{srv = Srv} = S0,
                     rdp_server:close(Srv),
-                    {stop, normal, S0#?MODULE{scard = SC1}}
+                    {stop, normal, S1}
             end
     end.
 
@@ -617,6 +639,11 @@ response(enter, _PrevState, S0 = #?MODULE{respbox = RB, sty = Sty, inst = Inst})
     ok = lv_scr:load_anim(Inst, Screen, fade_in, 500, 0, true),
 
     {keep_state, S0#?MODULE{events = [CBtnEvt, XBtnEvt], screen = Screen}};
+
+response(info, {'EXIT', Pid, _Why}, S0 = #?MODULE{piv = Pid}) ->
+    {keep_state, S0#?MODULE{piv = undefined}};
+response(info, {'EXIT', _Pid, _Why}, _S0 = #?MODULE{}) ->
+    keep_state_and_data;
 
 response(info, {_, exit}, S0 = #?MODULE{srv = Srv}) ->
     rdp_server:close(Srv),

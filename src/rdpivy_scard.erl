@@ -111,26 +111,28 @@ get_rdr_infos([], SC0) ->
 get_rdr_infos([Rdr | Rest], SC0) ->
     case rdpdr_scard:connect(Rdr, shared, {t0_or_t1, optimal}, SC0) of
         {ok, Mode, SC1} ->
-            case (catch get_rdr_info(Rdr, Mode, SC1)) of
+            {ok, [Piv | _]} = apdu_stack:start_link(element(1, Mode),
+                [nist_piv, iso7816_chain, iso7816, {rdpdr_scard_apdu, [SC1]}]),
+            Res = (catch get_rdr_info(Rdr, Piv)),
+            exit(Piv, kill),
+            receive {'EXIT', Piv, _} -> ok end,
+            {ok, SC2} = rdpdr_scard:disconnect(leave, SC1),
+            case Res of
                 {ok, Info} ->
-                    {ok, SC2} = rdpdr_scard:disconnect(leave, SC1),
                     case get_rdr_infos(Rest, SC2) of
                         {ok, RestInfo, SC3} ->
                             {ok, [Info | RestInfo], SC3};
                         Err ->
                             Err
                     end;
-                Err ->
-                    {ok, SC2} = rdpdr_scard:disconnect(leave, SC1),
+                _Err ->
                     get_rdr_infos(Rest, SC2)
             end;
-        Err ->
+        _Err ->
             get_rdr_infos(Rest, SC0)
     end.
 
-get_rdr_info(Rdr, Mode, SC0) ->
-    {ok, [Piv | _]} = apdu_stack:start_link(element(1, Mode),
-        [nist_piv, iso7816_chain, iso7816, {rdpdr_scard_apdu, [SC0]}]),
+get_rdr_info(Rdr, Piv) ->
     ok = apdu_transform:begin_transaction(Piv),
     {ok, [{ok, #{version := V}}]} = apdu_transform:command(Piv, select),
     {ok, [{ok, #{guid := Guid}}]} = apdu_transform:command(Piv, read_chuid),
