@@ -1,11 +1,66 @@
 [
     {rdpivy, [
+        %%
+        %% Port to listen for incoming RDP connections on
+        %%
         {port, 3389},
+
+        %%
+        %% Options for TLS/SSL establishment inside RDP
+        %%
+        %% You probably want certfile/keyfile here and cacertfile.
+        %%
         {ssl_options, [
             {certfile, "config/cert.pem"},
             {keyfile, "config/key.pem"}
         ]},
+
+        %%
+        %% Path to a file containing concatenated CA certificates which will
+        %% be used to validate CAK certs on smartcards.
+        %%
+        %% A warning is displayed if users are about to enter a PIN for a
+        %% device which does not have a signed CAK cert.
+        %%
         {ca_certs, "/etc/ssl/certs/EAIT_Internal_CA.pem"}
+    ]},
+
+    {rdp_lvgl, [
+        %%
+        %% The LVGL NIF will fork children to handle running LVGL code. Each
+        %% child can handle multiple display instances at once. It is possible
+        %% for displays which are running in the same child to block each
+        %% others' rendering to some extent, and rendering is single-threaded
+        %% within each child, so it is important to limit the maximum number
+        %% of displays per child.
+        %%
+        %% Recommended range: 8-32
+        %%
+        {displays_per_child, 8},
+
+        %%
+        %% Maximum number of children to fork, and initial number to pre-fork at
+        %% startup. If no children with spare display slots are available, we
+        %% will fork new children up to child_procs_max. If we are already at
+        %% child_procs_max, then lv:setup() will start returning errors.
+        %%
+        {child_procs_max, 4},
+        {child_procs_init, 2},
+
+        %%
+        %% Maximum resolution of a single display. Display framebuffers are
+        %% all allocated in advance at maximum resolution, so this controls the
+        %% memory consumption of the NIF directly.
+        %%
+        {display_max_res, {2560, 1440}},
+
+        %%
+        %% Size of command and event rings which we use to exchange data with
+        %% the child processes, in bytes.
+        %%
+        %% Recommended value: 16k (16384 bytes)
+        %%
+        {ring_size, 16384}
     ]},
 
     {lager, [
