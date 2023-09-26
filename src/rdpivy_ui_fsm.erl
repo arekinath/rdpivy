@@ -166,8 +166,9 @@ make_group(TopLevel, Symbol, #?MODULE{inst = Inst, sty = Sty}) ->
     {ok, Outer} = lv_obj:create(Inst, TopLevel),
     ok = lv_obj:add_style(Outer, GroupStyle),
 
-    {ok, Sym} = lv_img:create(Outer),
-    ok = lv_img:set_src(Sym, Symbol),
+    {ok, Sym} = lv_label:create(Outer),
+    ok = lv_obj:set_style_text_font(Sym, {"lineawesome", regular, 20}),
+    ok = lv_label:set_text(Sym, unicode:characters_to_binary([Symbol], utf8)),
     ok = lv_obj:align(Sym, left_mid),
 
     {ok, InnerFlex} = lv_obj:create(Inst, Outer),
@@ -266,7 +267,7 @@ login(enter, _PrevState, S0 = #?MODULE{inst = Inst, scard = SC0, sty = Sty}) ->
                 UPNMap = maps:get(upns, CardInfo, #{}),
                 UPNs = lists:flatten(maps:values(UPNMap)),
 
-                Group = make_group(Flex, sd_card, S0),
+                Group = make_group(Flex, 16#f2c2, S0),
 
                 {ok, RdrLbl} = lv_label:create(Group),
                 ok = lv_label:set_text(RdrLbl, RdrName),
