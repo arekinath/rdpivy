@@ -343,7 +343,7 @@ login(enter, _PrevState, S0 = #?MODULE{inst = Inst, scard = SC0, sty = Sty}) ->
                         {ok, YkBtnLbl} = lv_label:create(YkBtn),
                         ok = lv_label:set_text(YkBtnLbl, "Login"),
 
-                        {ok, YkBtnEvent, _} = lv_event:setup(YkBtn, pressed,
+                        {ok, YkBtnEvent, _} = lv_event:setup(YkBtn, short_clicked,
                             {login, CardInfo, PinText}),
                         {ok, YkAcEvent, _} = lv_event:setup(PinText, ready,
                             {login, CardInfo, PinText}),
@@ -547,8 +547,8 @@ confirm(enter, _PrevState, S0 = #?MODULE{inst = Inst, sty = Sty, chal = Chal,
     ok = lv_label:set_text(XBtnLbl, "Cancel"),
     ok = lv_obj:set_style_bg_color(XBtn, lv_color:lighten(red, 2)),
 
-    {ok, CBtnEvt, _} = lv_event:setup(CBtn, pressed, confirm),
-    {ok, XBtnEvt, _} = lv_event:setup(XBtn, pressed, cancel),
+    {ok, CBtnEvt, _} = lv_event:setup(CBtn, short_clicked, confirm),
+    {ok, XBtnEvt, _} = lv_event:setup(XBtn, short_clicked, cancel),
 
     ok = lv_scr:load_anim(Inst, Screen, fade_in, 500, 0, true),
 
@@ -633,8 +633,8 @@ response(enter, _PrevState, S0 = #?MODULE{respbox = RB, sty = Sty, inst = Inst})
     ok = lv_label:set_text(XBtnLbl, "Exit"),
     ok = lv_obj:set_style_bg_color(XBtn, lv_color:lighten(red, 2)),
 
-    {ok, CBtnEvt, _} = lv_event:setup(CBtn, pressed, {copy, Resp, CBtn}),
-    {ok, XBtnEvt, _} = lv_event:setup(XBtn, pressed, exit),
+    {ok, CBtnEvt, _} = lv_event:setup(CBtn, short_clicked, {copy, Resp, CBtn}),
+    {ok, XBtnEvt, _} = lv_event:setup(XBtn, short_clicked, exit),
 
     ok = lv_scr:load_anim(Inst, Screen, fade_in, 500, 0, true),
 
@@ -714,11 +714,11 @@ get_chal(enter, _PrevState, S0 = #?MODULE{inst = Inst, sty = Sty}) ->
     {ok, PBtnLbl} = lv_label:create(PBtn),
     ok = lv_label:set_text(PBtnLbl, "Paste clipboard"),
 
-    {ok, BtnEvent, _} = lv_event:setup(Btn, pressed,
+    {ok, BtnEvent, _} = lv_event:setup(Btn, short_clicked,
         {submit, ChalInp}),
     {ok, AcEvent, _} = lv_event:setup(ChalInp, ready,
         {submit, ChalInp}),
-    {ok, PstEvent, _} = lv_event:setup(PBtn, pressed,
+    {ok, PstEvent, _} = lv_event:setup(PBtn, short_clicked,
         {paste_into, ChalInp}),
 
     ok = lv_scr:load_anim(Inst, Screen, fade_in, 500, 0, true),
